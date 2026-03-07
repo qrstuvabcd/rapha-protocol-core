@@ -1,0 +1,87 @@
+Metadata-Version: 2.4
+Name: rapha-ai
+Version: 0.1.0
+Summary: The official SDK for Rapha Protocol: Compute-to-Data AI Training
+Home-page: https://rapha.ltd
+Author: Rapha Protocol Team
+Author-email: hello@rapha.ltd
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Security :: Cryptography
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: requests>=2.25.0
+Requires-Dist: torch>=1.9.0
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# Rapha AI SDK
+
+The official Python SDK for the **Rapha Protocol**—a decentralized "Compute-to-Data" network for AI model training over sensitive health data.
+
+Instead of bringing data to the model, Rapha brings your model to the data using TEEs (Trusted Execution Environments) and ZK-TLS cryptography.
+
+## Installation
+
+Install the package directly from PyPI:
+
+```bash
+pip install rapha-ai
+```
+
+## Quickstart
+
+Initialize the `RaphaClient`, fund the escrow contract (for compute nodes), and execute remote training over HIPAA-compliant medical datasets securely.
+
+```python
+import torch
+import torch.nn as nn
+from rapha import RaphaClient
+
+# 1. Define your PyTorch Model Architecture
+class MedicalNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(3, 10)
+        self.fc2 = nn.Linear(10, 1)
+        
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        return self.fc2(x)
+
+model = MedicalNet()
+
+# 2. Initialize the Rapha Client
+# node_url defaults to production: https://api.rapha.ltd
+# For local testing, pass: node_url="http://127.0.0.1:8000"
+client = RaphaClient(escrow_contract_address="0xYourContractAddress")
+
+# 3. Fund your job with USDC
+job_id = client.fund_job(amount=100.0)
+print(f"Funded Job: {job_id}")
+
+# 4. Trigger remote training
+# The model weights are packaged, sent to the node, computed against the dataset,
+# and returned with a valid Zero-Knowledge proof. 
+zk_proof = client.train(model, target_dataset_id="hospital_dataset_1")
+
+# 5. Model state is updated in-place automatically
+print("Training Complete. Model weights updated securely.")
+
+# 6. Push proof to on-chain settlement
+client.settle(zk_proof)
+print("Node provider paid. Transaction complete.")
+```
+
+## Learn More
+
+Visit [rapha.ltd](https://rapha.ltd) for protocol documentation and enterprise features.
