@@ -14,46 +14,150 @@ pip install rapha-ai
 
 ## Quickstart
 
-Initialize the `RaphaClient`, fund the escrow contract (for compute nodes), and execute remote training over HIPAA-compliant medical datasets securely.
+### Option A: Train with a Pre-cached Model
+
+```python
+from rapha import RaphaClient
+
+client = RaphaClient(api_key="rp_live_...")
+
+# Browse available datasets
+datasets = client.list_datasets()
+for ds in datasets:
+    print(f"{ds.id}: {ds.name} ({ds.record_count:,} records)")
+
+# Train a pre-cached medical model
+job = client.train(
+    model="rapha-vitals-v1",
+    dataset="hospital_vitals_v1",
+    epochs=5,
+    learning_rate=0.01,
+)
+job.wait()
+print(job.metrics)
+
+# Settle payment to node operator
+client.settle(job)
+```
+
+### Option B: Bring Your Own PyTorch Model
 
 ```python
 import torch
 import torch.nn as nn
 from rapha import RaphaClient
 
-# 1. Define your PyTorch Model Architecture
+# Define your model
 class MedicalNet(nn.Module):
     def __init__(self):
         super().__init__()
         self.fc1 = nn.Linear(3, 10)
         self.fc2 = nn.Linear(10, 1)
-        
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         return self.fc2(x)
 
 model = MedicalNet()
 
-# 2. Initialize the Rapha Client
-# node_url defaults to production: https://api.rapha.ltd
-# For local testing, pass: node_url="http://127.0.0.1:8000"
-client = RaphaClient(escrow_contract_address="0xYourContractAddress")
+# Train on privacy-preserved hospital data
+client = RaphaClient(api_key="rp_live_...")
+job = client.train(
+    model=model,                        # PyTorch nn.Module
+    dataset="hospital_vitals_v1",
+    epochs=10,
+)
 
-# 3. Fund your job with USDC
-job_id = client.fund_job(amount=100.0)
-print(f"Funded Job: {job_id}")
+job.wait()
+print(f"Final loss: {job.metrics['final_loss']}")
 
-# 4. Trigger remote training
-# The model weights are packaged, sent to the node, computed against the dataset,
-# and returned with a valid Zero-Knowledge proof. 
-zk_proof = client.train(model, target_dataset_id="hospital_dataset_1")
+# Model weights are updated in-place automatically
+print("Training complete — weights updated.")
+client.settle(job)
+```
 
-# 5. Model state is updated in-place automatically
-print("Training Complete. Model weights updated securely.")
+### Option C: Drop a HuggingFace Model
 
-# 6. Push proof to on-chain settlement
-client.settle(zk_proof)
-print("Node provider paid. Transaction complete.")
+```python
+from rapha import RaphaClient
+
+client = RaphaClient(api_key="rp_live_...")
+
+job = client.train(
+    model="microsoft/BiomedNLP-BiomedBERT-base",   # HuggingFace model ID
+    dataset="diabetes_vitals_v2",
+    target_node="tokyo_med_01",
+    epochs=5,
+    learning_rate=1e-4,
+)
+
+job.stream_logs()               # Live training logs
+job.download_weights("./trained_biomedbert.pt")
+client.settle(job)
+```
+
+### Option D: Upload an ONNX Model
+
+```python
+from rapha import RaphaClient
+
+client = RaphaClient(api_key="rp_live_...")
+
+job = client.train(
+    model="./my_custom_model.onnx",     # Local ONNX file
+    dataset="cardiac_ecg_v1",
+    epochs=20,
+)
+
+job.wait()
+job.download_weights("./trained_model.pt")
+client.settle(job)
+```
+
+## Dataset Discovery
+
+```python
+from rapha import RaphaClient
+
+client = RaphaClient(api_key="rp_live_...")
+
+# List all datasets
+datasets = client.list_datasets()
+
+# Filter by condition
+cardio = client.list_datasets(condition="cardiovascular")
+
+# Inspect schema
+schema = client.describe_dataset("hospital_vitals_v1")
+print(schema.schema)   # [{"field": "blood_pressure_sys", "type": "integer", ...}, ...]
+```
+
+## Model Catalog
+
+```python
+from rapha import RaphaClient
+
+models = RaphaClient.list_models()
+for m in models:
+    print(f"{m['id']}: {m['name']} ({m['params']} params)")
+```
+
+## How It Works
+
+1. **You define a model** — PyTorch module, HuggingFace ID, or ONNX file.
+2. **SDK packages it** — Serialized and encrypted for transport.
+3. **Enterprise node trains** — Your model trains on local hospital data behind the firewall. Raw data **never leaves**.
+4. **You get back weights + proof** — Updated model weights and a zero-knowledge proof of computation.
+5. **Smart contract settles** — The escrow releases USDC to the node operator upon proof verification.
+
+## Local Development
+
+For local testing against the enterprise node:
+
+```python
+client = RaphaClient(
+    api_key="test_key",
+    node_url="http://127.0.0.1:8000"
+)
 ```
 
 ## Learn More

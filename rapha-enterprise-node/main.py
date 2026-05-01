@@ -1,7 +1,10 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 from trainer import run_local_training
-from db import init_db
+from db import (
+    init_db, create_job, update_job_status, get_job,
+    get_logs, append_log, list_datasets, get_dataset,
+)
 from auth.api_keys import verify_api_key
 from audit.logger import log_event, verify_audit_chain, export_audit_log
 import logging
@@ -20,7 +23,7 @@ import os
 
 app = FastAPI(
     title="Rapha Enterprise Node",
-    version="2.0.0",
+    version="3.0.0",
     description="Privacy-preserving AI training behind hospital firewalls",
     docs_url=None if os.getenv("RAPHA_ENV") == "production" else "/docs",
     redoc_url=None,
@@ -35,16 +38,31 @@ logger = logging.getLogger("rapha.node")
 
 # ── Request / Response Models ─────────────────────────────
 
+class ModelPayload(BaseModel):
+    """Model data sent from the SDK."""
+    format: str = Field(default="pytorch", description="Model format: pytorch, onnx, huggingface")
+    weights: str | None = Field(default=None, description="Base64-encoded model weights")
+    full_model: str | None = Field(default=None, description="Base64-encoded full model (architecture + weights)")
+    model_data: str | None = Field(default=None, description="Base64-encoded ONNX model data")
+    model_id: str | None = Field(default=None, description="HuggingFace model identifier")
+    architecture: str | None = Field(default=None, description="Model architecture name")
+    param_count: int | None = Field(default=None, description="Parameter count")
+    resolved_locally: bool = Field(default=False, description="Whether HF model was resolved client-side")
+
+
 class TrainingPayload(BaseModel):
     dataset_id: str = Field(..., description="Target dataset identifier")
-    weights: str = Field(..., description="Base64-encoded model weights")
+    weights: str | None = Field(default=None, description="Base64-encoded model weights (legacy)")
     job_id: str = Field(..., description="Unique job identifier from escrow contract")
+    model_payload: ModelPayload | None = Field(default=None, description="Full model payload from SDK v0.2+")
     model_arch: str = Field(
-        default="mock_net",
-        description="Model architecture identifier (future: ONNX registry)",
+        default="auto",
+        description="Model architecture identifier (auto-detected from payload)",
     )
     epochs: int = Field(default=5, ge=1, le=100, description="Training epochs")
     learning_rate: float = Field(default=0.01, gt=0, le=1.0, description="Learning rate")
+    batch_size: int = Field(default=32, ge=1, le=512, description="Batch size")
+    target_node: str | None = Field(default=None, description="Target node identifier")
 
 
 class TrainingResult(BaseModel):
@@ -53,6 +71,8 @@ class TrainingResult(BaseModel):
     job_id: str
     training_duration_ms: int
     epochs_completed: int
+    final_loss: float | None = None
+    metrics: dict = {}
 
 
 class HealthResponse(BaseModel):
@@ -63,6 +83,41 @@ class HealthResponse(BaseModel):
     audit_entries: int
 
 
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    metrics: dict = {}
+    zk_proof: str | None = None
+    updated_weights: str | None = None
+    error: str | None = None
+    created_at: float | None = None
+    started_at: float | None = None
+    completed_at: float | None = None
+
+
+class JobLogsResponse(BaseModel):
+    job_id: str
+    status: str
+    logs: list[str] = []
+
+
+class DatasetResponse(BaseModel):
+    id: str
+    node_id: str
+    name: str
+    description: str
+    condition: str
+    record_count: int
+    schema: list[dict] = []
+    data_types: list[str] = []
+    created_at: str = ""
+
+
+class DatasetListResponse(BaseModel):
+    datasets: list[DatasetResponse]
+    node_id: str
+
+
 # ── Lifecycle Events ──────────────────────────────────────
 
 @app.on_event("startup")
@@ -70,7 +125,7 @@ def startup_event():
     init_db()
     logger.info("Rapha Enterprise Node starting up")
     logger.info(f"Node ID: {os.getenv('RAPHA_NODE_ID', 'node-unnamed')}")
-    logger.info("Mock EHR database initialized")
+    logger.info("Database initialized (EHR, Jobs, Catalog)")
 
 
 # ── Endpoints ─────────────────────────────────────────────
@@ -81,12 +136,42 @@ def health_check():
     chain_valid, entry_count = verify_audit_chain()
     return HealthResponse(
         status="Rapha Node Active",
-        version="2.0.0",
+        version="3.0.0",
         node_id=os.getenv("RAPHA_NODE_ID", "node-unnamed"),
         audit_chain_valid=chain_valid,
         audit_entries=entry_count,
     )
 
+
+# ── Dataset Catalog ───────────────────────────────────────
+
+@app.get("/datasets", response_model=DatasetListResponse)
+def get_datasets(
+    condition: str | None = Query(None, description="Filter by medical condition"),
+):
+    """List available training datasets on this node.
+
+    No auth required — dataset metadata is public.
+    Raw data never leaves the node.
+    """
+    datasets = list_datasets(condition=condition)
+    node_id = os.getenv("RAPHA_NODE_ID", "node-unnamed")
+    return DatasetListResponse(
+        datasets=[DatasetResponse(**d) for d in datasets],
+        node_id=node_id,
+    )
+
+
+@app.get("/datasets/{dataset_id}", response_model=DatasetResponse)
+def get_dataset_detail(dataset_id: str):
+    """Get detailed metadata for a specific dataset."""
+    ds = get_dataset(dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' not found")
+    return DatasetResponse(**ds)
+
+
+# ── Training ──────────────────────────────────────────────
 
 @app.post("/train", response_model=TrainingResult)
 def receive_payload_and_train(
@@ -97,8 +182,32 @@ def receive_payload_and_train(
 
     Requires valid API key. All requests are audit-logged.
     Raw data never leaves this endpoint — only model weights are returned.
+
+    Accepts models in multiple formats:
+      - PyTorch full model (architecture + weights)
+      - PyTorch state dict only (legacy — uses MockNet)
+      - HuggingFace model ID (server-side download)
     """
     logger.info(f"[{org}] Training request: job={payload.job_id} dataset={payload.dataset_id}")
+
+    # Determine model format for logging
+    model_format = "legacy"
+    model_arch = payload.model_arch
+    if payload.model_payload:
+        model_format = payload.model_payload.format
+        model_arch = payload.model_payload.architecture or "auto"
+
+    # Register job in database
+    create_job(
+        job_id=payload.job_id,
+        dataset_id=payload.dataset_id,
+        model_format=model_format,
+        model_architecture=model_arch,
+        epochs=payload.epochs,
+        learning_rate=payload.learning_rate,
+        batch_size=payload.batch_size,
+        org=org,
+    )
 
     # Audit: log the incoming request
     log_event(
@@ -107,7 +216,8 @@ def receive_payload_and_train(
         org=org,
         details={
             "dataset_id": payload.dataset_id,
-            "model_arch": payload.model_arch,
+            "model_format": model_format,
+            "model_arch": model_arch,
             "epochs": payload.epochs,
         },
     )
@@ -115,16 +225,37 @@ def receive_payload_and_train(
     start_time = time.time()
 
     try:
-        updated_weights = run_local_training(
-            payload.weights,
+        # Prepare model payload dict for the trainer
+        model_payload_dict = None
+        if payload.model_payload:
+            model_payload_dict = payload.model_payload.model_dump()
+
+        result = run_local_training(
+            b64_model_weights=payload.weights or "",
             epochs=payload.epochs,
             learning_rate=payload.learning_rate,
+            job_id=payload.job_id,
+            model_payload=model_payload_dict,
         )
 
         duration_ms = int((time.time() - start_time) * 1000)
 
+        # Extract results
+        updated_weights = result["updated_weights"]
+        metrics = result.get("metrics", {})
+        final_loss = metrics.get("final_loss")
+
         # TODO: Replace with real ZK proof generation (Risc Zero / SP1)
         zk_proof = f"zk_snark_proof_{payload.job_id}_valid"
+
+        # Update job in database
+        update_job_status(
+            payload.job_id,
+            "completed",
+            metrics={**metrics, "training_duration_ms": duration_ms},
+            zk_proof=zk_proof,
+            updated_weights=updated_weights,
+        )
 
         # Audit: log successful completion
         log_event(
@@ -134,11 +265,12 @@ def receive_payload_and_train(
             details={
                 "duration_ms": duration_ms,
                 "epochs_completed": payload.epochs,
+                "final_loss": final_loss,
                 "proof_hash": zk_proof[:32],
             },
         )
 
-        logger.info(f"[{org}] Training complete: job={payload.job_id} duration={duration_ms}ms")
+        logger.info(f"[{org}] Training complete: job={payload.job_id} duration={duration_ms}ms loss={final_loss}")
 
         return TrainingResult(
             updated_weights=updated_weights,
@@ -146,10 +278,15 @@ def receive_payload_and_train(
             job_id=payload.job_id,
             training_duration_ms=duration_ms,
             epochs_completed=payload.epochs,
+            final_loss=final_loss,
+            metrics=metrics,
         )
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
+
+        # Update job status
+        update_job_status(payload.job_id, "failed", error=str(e))
 
         # Audit: log failure
         log_event(
@@ -162,6 +299,55 @@ def receive_payload_and_train(
         logger.error(f"[{org}] Training failed: job={payload.job_id} error={e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── Job Status & Logs ─────────────────────────────────────
+
+@app.get("/jobs/{job_id}/status", response_model=JobStatusResponse)
+def get_job_status(
+    job_id: str,
+    org: str = Depends(verify_api_key),
+):
+    """Get the current status of a training job."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    return JobStatusResponse(
+        job_id=job["job_id"],
+        status=job["status"],
+        metrics=job.get("metrics", {}),
+        zk_proof=job.get("zk_proof"),
+        updated_weights=job.get("updated_weights"),
+        error=job.get("error"),
+        created_at=job.get("created_at"),
+        started_at=job.get("started_at"),
+        completed_at=job.get("completed_at"),
+    )
+
+
+@app.get("/jobs/{job_id}/logs", response_model=JobLogsResponse)
+def get_job_logs(
+    job_id: str,
+    offset: int = Query(0, ge=0, description="Number of log lines to skip"),
+    org: str = Depends(verify_api_key),
+):
+    """Stream training logs for a job.
+
+    Use offset to poll for new lines incrementally.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    logs = get_logs(job_id, offset=offset)
+    return JobLogsResponse(
+        job_id=job_id,
+        status=job["status"],
+        logs=logs,
+    )
+
+
+# ── Audit ─────────────────────────────────────────────────
 
 @app.get("/audit/export")
 def get_audit_log(
