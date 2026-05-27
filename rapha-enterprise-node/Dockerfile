@@ -53,4 +53,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 USER rapha
 
 # Production server with limited workers (memory-constrained hospital environments)
-CMD ["sh", "-c", "cd /tmp/rapha && gunicorn --chdir /app main:app -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8000} --timeout 300 --worker-tmp-dir /tmp/rapha"]
+CMD ["sh", "-c", "mkdir -p /tmp/rapha && cd /tmp/rapha && gunicorn --chdir /app main:app -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8000} --timeout 300 --worker-tmp-dir /tmp/rapha"]
