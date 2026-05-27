@@ -7,18 +7,22 @@ Manages:
   - Dataset catalog metadata
 """
 
+import os
 import sqlite3
 import json
 import time
 import logging
+from pathlib import Path
 
 logger = logging.getLogger("rapha.db")
 
-DB_PATH = "hospital_mock.db"
+DB_PATH = os.getenv("RAPHA_DB_PATH", "/tmp/rapha/hospital_mock.db")
 
 
 def get_connection():
     """Get a SQLite connection with row factory enabled."""
+    db_path = Path(DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn

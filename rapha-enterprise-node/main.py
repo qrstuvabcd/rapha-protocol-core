@@ -10,6 +10,8 @@ from audit.logger import log_event, verify_audit_chain, export_audit_log
 import logging
 import time
 import os
+import hashlib
+import json
 
 # ──────────────────────────────────────────────────────────
 # Rapha Enterprise Node — Production-Hardened API
@@ -34,6 +36,18 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("rapha.node")
+
+
+def build_compute_receipt_hash(job_id: str, dataset_id: str, metrics: dict, updated_weights: str) -> str:
+    """Build a deterministic receipt commitment without exposing local records."""
+    material = {
+        "job_id": job_id,
+        "dataset_id": dataset_id,
+        "metrics": metrics,
+        "updated_weights_sha256": hashlib.sha256(updated_weights.encode("utf-8")).hexdigest(),
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "compute_receipt_sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 # ── Request / Response Models ─────────────────────────────
@@ -108,7 +122,7 @@ class DatasetResponse(BaseModel):
     description: str
     condition: str
     record_count: int
-    schema: list[dict] = []
+    schema_: list[dict] = Field(default_factory=list, alias="schema")
     data_types: list[str] = []
     created_at: str = ""
 
@@ -245,8 +259,12 @@ def receive_payload_and_train(
         metrics = result.get("metrics", {})
         final_loss = metrics.get("final_loss")
 
-        # TODO: Replace with real ZK proof generation (Risc Zero / SP1)
-        zk_proof = f"zk_snark_proof_{payload.job_id}_valid"
+        zk_proof = build_compute_receipt_hash(
+            payload.job_id,
+            payload.dataset_id,
+            metrics,
+            updated_weights,
+        )
 
         # Update job in database
         update_job_status(

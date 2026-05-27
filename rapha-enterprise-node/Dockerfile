@@ -29,13 +29,16 @@ WORKDIR /app
 # Copy application code
 COPY --chown=rapha:rapha . .
 
-# Create audit log directory with proper permissions
-RUN mkdir -p /var/log/rapha && chown rapha:rapha /var/log/rapha
+# Create writable runtime directories with proper permissions.
+# Render mounts the application directory read-only at runtime, so SQLite,
+# Gunicorn control files, and audit logs must not write under /app.
+RUN mkdir -p /tmp/rapha /var/log/rapha && chown -R rapha:rapha /tmp/rapha /var/log/rapha
 
 # Environment defaults
 ENV RAPHA_ENV=production \
     RAPHA_NODE_ID=node-unnamed \
     RAPHA_AUDIT_DIR=/var/log/rapha \
+    RAPHA_DB_PATH=/tmp/rapha/hospital_mock.db \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -50,4 +53,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 USER rapha
 
 # Production server with limited workers (memory-constrained hospital environments)
-CMD ["sh", "-c", "gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8000} --timeout 300"]
+CMD ["sh", "-c", "cd /tmp/rapha && gunicorn --chdir /app main:app -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8000} --timeout 300 --worker-tmp-dir /tmp/rapha"]
